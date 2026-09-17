@@ -1,7 +1,7 @@
 import Foundation
 import AVFoundation
 
-// MARK: - Merge helper
+// MARK: - Helpers
 
 func mergeAudio(system: URL, mic: URL, to output: URL) async throws {
     let systemAsset = AVURLAsset(url: system)
@@ -27,12 +27,24 @@ func mergeAudio(system: URL, mic: URL, to output: URL) async throws {
     try await session.export(to: output, as: .m4a)
 }
 
+func discoverInputDevices() -> [AVCaptureDevice] {
+    AVCaptureDevice.DiscoverySession(
+        deviceTypes: [.microphone],
+        mediaType: .audio,
+        position: .unspecified
+    ).devices
+}
+
+func findDevice(matching name: String) -> AVCaptureDevice? {
+    discoverInputDevices().first { $0.localizedName.localizedCaseInsensitiveContains(name) }
+}
+
 // MARK: - Parse arguments
 
 var outputDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Recordings")
-
 var label: String? = nil
+var deviceQuery: String? = nil
 
 var args = CommandLine.arguments.dropFirst().makeIterator()
 while let arg = args.next() {
@@ -49,16 +61,36 @@ while let arg = args.next() {
             exit(1)
         }
         label = name
+    case "--device", "-d":
+        guard let name = args.next() else {
+            fputs("Error: --device requires a device name\n", stderr)
+            exit(1)
+        }
+        deviceQuery = name
+    case "--list-devices", "-l":
+        let devices = discoverInputDevices()
+        let defaultDevice = AVCaptureDevice.default(for: .audio)
+        if devices.isEmpty {
+            print("No audio input devices found.")
+        } else {
+            for device in devices {
+                let marker = device.uniqueID == defaultDevice?.uniqueID ? " (default)" : ""
+                print("  \(device.localizedName)\(marker)")
+            }
+        }
+        exit(0)
     case "--help", "-h":
         print("""
         audio-capture — Record system audio and microphone
 
-        Usage: audio-capture [--name <label>] [--output <directory>]
+        Usage: audio-capture [options]
 
         Options:
-          -n, --name <label>  Label for the recording (e.g. "standup", "1on1-with-alex")
-          -o, --output <dir>  Output directory (default: ~/Recordings)
-          -h, --help          Show this help
+          -n, --name <label>    Label for the recording (e.g. "standup", "1on1-with-alex")
+          -d, --device <name>   Microphone to use (substring match, see --list-devices)
+          -l, --list-devices    List available microphones
+          -o, --output <dir>    Output directory (default: ~/Recordings)
+          -h, --help            Show this help
 
         Saves a single merged .m4a file with both system audio and mic:
           <timestamp>[_label].m4a
@@ -71,6 +103,27 @@ while let arg = args.next() {
         fputs("Unknown option: \(arg). Use --help for usage.\n", stderr)
         exit(1)
     }
+}
+
+// MARK: - Resolve mic device
+
+let micDevice: AVCaptureDevice
+if let query = deviceQuery {
+    guard let device = findDevice(matching: query) else {
+        fputs("No input device matching \"\(query)\".\n", stderr)
+        fputs("Available devices:\n", stderr)
+        for device in discoverInputDevices() {
+            fputs("  \(device.localizedName)\n", stderr)
+        }
+        exit(1)
+    }
+    micDevice = device
+} else {
+    guard let device = AVCaptureDevice.default(for: .audio) else {
+        fputs("No audio input device found.\n", stderr)
+        exit(1)
+    }
+    micDevice = device
 }
 
 // MARK: - Setup
@@ -123,24 +176,12 @@ do {
 
 // MARK: - Start microphone
 
-let micRecorder: AVAudioRecorder
+let micRecorder = MicRecorder()
 do {
-    micRecorder = try AVAudioRecorder(url: micTempURL, settings: [
-        AVFormatIDKey: kAudioFormatMPEG4AAC,
-        AVSampleRateKey: 48000.0,
-        AVNumberOfChannelsKey: 1,
-        AVEncoderBitRateKey: 64000,
-    ])
+    try micRecorder.start(to: micTempURL, device: micDevice)
 } catch {
-    fputs("Failed to set up microphone: \(error.localizedDescription)\n", stderr)
+    fputs("Failed to start microphone: \(error.localizedDescription)\n", stderr)
     fputs("Grant Microphone permission in System Settings → Privacy & Security.\n", stderr)
-    try? await systemRecorder.stop()
-    try? FileManager.default.removeItem(at: tempDir)
-    exit(1)
-}
-
-guard micRecorder.record() else {
-    fputs("Failed to start microphone recording.\n", stderr)
     try? await systemRecorder.stop()
     try? FileManager.default.removeItem(at: tempDir)
     exit(1)
@@ -150,6 +191,7 @@ guard micRecorder.record() else {
 
 let startTime = Date()
 print("Recording started at \(DateFormatter.localizedString(from: startTime, dateStyle: .none, timeStyle: .short))")
+print("  Microphone: \(micDevice.localizedName)")
 print("Press Ctrl+C to stop.")
 
 for await _ in stopSignal { break }
@@ -159,7 +201,7 @@ for await _ in stopSignal { break }
 let elapsed = Int(Date().timeIntervalSince(startTime))
 
 print("\nStopping...")
-micRecorder.stop()
+await micRecorder.stop()
 try await systemRecorder.stop()
 
 let h = elapsed / 3600
