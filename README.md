@@ -5,7 +5,7 @@ A macOS CLI tool that records both system audio and microphone input into a sing
 ## How it works
 
 - **System audio** (other participants) is captured transparently via [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) — no virtual audio devices, no configuration changes in your meeting app
-- **Microphone** (you) is recorded via AVAudioRecorder using your default input device
+- **Microphone** (you) is recorded via AVCaptureSession using your default input device (or one you pick with `--device`)
 - Both streams are merged into a single time-synced `.m4a` file when you stop recording
 
 No new audio devices appear in your system. Google Meet, Zoom, and other apps don't need any settings changes.
@@ -25,9 +25,11 @@ make install  # installs to /usr/local/bin
 ## Usage
 
 ```
-audio-capture                        # start recording, Ctrl+C to stop
-audio-capture -n "standup"           # label the recording
-audio-capture -n "1on1" -o ~/Audio   # custom output directory
+audio-capture                              # start recording, Ctrl+C to stop
+audio-capture -n "standup"                 # label the recording
+audio-capture -n "1on1" -o ~/Audio         # custom output directory
+audio-capture -l                           # list available microphones
+audio-capture -d "USB" -n "standup"        # use a specific mic
 ```
 
 Files are saved to `~/Recordings/` by default:
@@ -41,6 +43,8 @@ Files are saved to `~/Recordings/` by default:
 | Flag | Description |
 |------|-------------|
 | `-n, --name <label>` | Label appended to the filename |
+| `-d, --device <name>` | Microphone to use (substring match) |
+| `-l, --list-devices` | List available microphones |
 | `-o, --output <dir>` | Output directory (default: `~/Recordings`) |
 | `-h, --help` | Show help |
 
