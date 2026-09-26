@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Live transcription of raw s16le mono PCM from stdin using a local whisper.cpp server.
+
+    audio-capture -n standup | transcribe -o standup.txt
+"""
+
+import argparse
+import array
+import io
+import itertools
+import json
+import os
+import queue
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+import uuid
+import wave
+
+DEFAULT_MODEL = os.path.expanduser("~/.whisper-models/ggml-large-v3-turbo.bin")
+SILENT_RMS = 50
+NON_SPEECH = {"[BLANK_AUDIO]", "[ Silence ]", "[silence]", "(silence)", "[MUSIC]", "(music)"}
+
+
+def eprint(*args):
+    print(*args, file=sys.stderr, flush=True)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Transcribe live s16le mono PCM from stdin with whisper.cpp.")
+    p.add_argument("-o", "--output", help="also append the transcript to this file")
+    p.add_argument("-m", "--model", default=os.environ.get("WHISPER_MODEL", DEFAULT_MODEL),
+                   help="whisper.cpp model (default: $WHISPER_MODEL or %(default)s)")
+    p.add_argument("-l", "--language", default="en", help="spoken language, or 'auto' (default: en)")
+    p.add_argument("-r", "--rate", type=int, default=16000,
+                   help="input sample rate, must match audio-capture --pipe-rate (default: 16000)")
+    p.add_argument("-c", "--chunk", type=float, default=8.0,
+                   help="seconds of audio per transcription request (default: 8)")
+    return p.parse_args()
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def start_server(model, language):
+    port = free_port()
+    log = tempfile.NamedTemporaryFile(prefix="whisper-server-", suffix=".log", delete=False)
+    # Own session so the Ctrl+C sent to the pipeline doesn't kill the server mid-transcription.
+    proc = subprocess.Popen(
+        ["whisper-server", "-m", model, "-l", language, "--host", "127.0.0.1", "--port", str(port)],
+        stdout=log, stderr=log, start_new_session=True)
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            eprint(open(log.name).read()[-2000:])
+            sys.exit(f"whisper-server exited (log: {log.name})")
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+            return proc, f"http://127.0.0.1:{port}/inference"
+        except OSError:
+            time.sleep(0.2)
+    proc.kill()
+    sys.exit(f"whisper-server didn't start within 2 minutes (log: {log.name})")
+
+
+def to_wav(samples, rate):
+    out = io.BytesIO()
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(samples.tobytes())
+    return out.getvalue()
+
+
+def post_chunk(url, wav_bytes):
+    boundary = uuid.uuid4().hex
+    body = io.BytesIO()
+    for name, value in (("response_format", "json"), ("temperature", "0.0")):
+        body.write(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+    body.write(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="chunk.wav"\r\n'
+               f'Content-Type: audio/wav\r\n\r\n'.encode())
+    body.write(wav_bytes)
+    body.write(f"\r\n--{boundary}--\r\n".encode())
+    request = urllib.request.Request(url, data=body.getvalue(),
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(request, timeout=600) as response:
+        return json.load(response).get("text", "")
+
+
+def rms(samples):
+    return (sum(s * s for s in samples) / len(samples)) ** 0.5 if samples else 0
+
+
+def quietest_cut(buf, rate, earliest):
+    """Index of the quietest 0.2s window after `earliest`, so chunks split between words rather than mid-word."""
+    window, step = rate // 5, rate // 20
+    energy = list(itertools.accumulate((s * s for s in buf), initial=0))
+    best, best_energy = len(buf), None
+    for start in range(earliest, len(buf) - window + 1, step):
+        e = energy[start + window] - energy[start]
+        if best_energy is None or e < best_energy:
+            best, best_energy = start + window // 2, e
+    return best
+
+
+def format_time(seconds):
+    s = int(seconds)
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def transcriber(url, rate, jobs, output):
+    while (job := jobs.get()) is not None:
+        offset, samples = job
+        if jobs.qsize() > 3:
+            eprint(f"Warning: transcription is {jobs.qsize()} chunks behind; try a smaller model.")
+        try:
+            text = " ".join(post_chunk(url, to_wav(samples, rate)).split())
+        except Exception as error:
+            eprint(f"Transcription failed at {format_time(offset)}: {error}")
+            continue
+        if not text or text in NON_SPEECH:
+            continue
+        line = f"[{format_time(offset)}] {text}"
+        print(line, flush=True)
+        if output:
+            output.write(line + "\n")
+            output.flush()
+
+
+def main():
+    args = parse_args()
+    if not os.path.exists(args.model):
+        sys.exit(f"Model not found: {args.model}\nPass one with -m or set WHISPER_MODEL.")
+    if sys.stdin.isatty():
+        sys.exit("transcribe reads raw audio from stdin, e.g.: audio-capture | transcribe")
+
+    interrupts = 0
+
+    def on_interrupt(*_):
+        # Keep going on the first Ctrl+C: audio-capture closes the pipe once it has flushed, and we finish then.
+        nonlocal interrupts
+        interrupts += 1
+        if interrupts > 1:
+            os._exit(130)
+        eprint("Finishing transcription... (Ctrl+C again to quit now)")
+
+    signal.signal(signal.SIGINT, on_interrupt)
+
+    eprint(f"Loading {os.path.basename(args.model)}...")
+    server, url = start_server(args.model, args.language)
+    eprint("Transcribing. Lines appear every ~%ds." % args.chunk)
+
+    output = open(args.output, "a") if args.output else None
+    jobs = queue.Queue()
+    worker = threading.Thread(target=transcriber, args=(url, args.rate, jobs, output))
+    worker.start()
+
+    target = int(args.chunk * args.rate)
+    block_bytes = args.rate // 10 * 2
+    buf = array.array("h")
+    offset = 0
+    try:
+        while data := sys.stdin.buffer.read(block_bytes):
+            buf.frombytes(data[: len(data) // 2 * 2])
+            if len(buf) >= target:
+                cut = quietest_cut(buf, args.rate, target // 2)
+                if rms(buf[:cut]) >= SILENT_RMS:
+                    jobs.put((offset / args.rate, buf[:cut]))
+                offset += cut
+                buf = buf[cut:]
+        if len(buf) and rms(buf) >= SILENT_RMS:
+            jobs.put((offset / args.rate, buf))
+    finally:
+        jobs.put(None)
+        worker.join()
+        server.terminate()
+        try:
+            server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            server.kill()
+        if output:
+            output.close()
+
+
+if __name__ == "__main__":
+    main()

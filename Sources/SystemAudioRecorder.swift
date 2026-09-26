@@ -1,16 +1,17 @@
 import Foundation
 import ScreenCaptureKit
-import AVFoundation
 import CoreMedia
 
 final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let audioQueue = DispatchQueue(label: "audio-capture.system")
+    private let onBuffer: (CMSampleBuffer, CMTime) -> Void
     private var stream: SCStream?
-    private var assetWriter: AVAssetWriter?
-    private var audioInput: AVAssetWriterInput?
-    private var sessionStarted = false
 
-    func start(to url: URL) async throws {
+    init(onBuffer: @escaping (CMSampleBuffer, CMTime) -> Void) {
+        self.onBuffer = onBuffer
+    }
+
+    func start() async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         guard let display = content.displays.first else {
             throw CaptureError.noDisplay
@@ -21,24 +22,11 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @un
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
-        config.channelCount = 2
-        config.sampleRate = 48000
+        config.channelCount = 1
+        config.sampleRate = Int(AudioMixer.sampleRate)
         config.width = 2
         config.height = 2
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-
-        let writer = try AVAssetWriter(url: url, fileType: .m4a)
-        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: 48000,
-            AVNumberOfChannelsKey: 2,
-            AVEncoderBitRateKey: 128000,
-        ])
-        input.expectsMediaDataInRealTime = true
-        writer.add(input)
-
-        self.assetWriter = writer
-        self.audioInput = input
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
@@ -51,40 +39,20 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @un
             try await stream.stopCapture()
             self.stream = nil
         }
-
         audioQueue.sync {}
-
-        audioInput?.markAsFinished()
-        if let writer = assetWriter, writer.status == .writing {
-            await writer.finishWriting()
-        }
-        assetWriter = nil
-        audioInput = nil
     }
 
     // MARK: - SCStreamOutput
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio,
-              sampleBuffer.isValid,
-              let writer = assetWriter,
-              let input = audioInput else { return }
-
-        if !sessionStarted {
-            writer.startWriting()
-            writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
-            sessionStarted = true
-        }
-
-        if writer.status == .writing, input.isReadyForMoreMediaData {
-            input.append(sampleBuffer)
-        }
+        guard type == .audio, sampleBuffer.isValid else { return }
+        onBuffer(sampleBuffer, sampleBuffer.presentationTimeStamp)
     }
 
     // MARK: - SCStreamDelegate
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        fputs("System audio error: \(error.localizedDescription)\n", stderr)
+        eprint("System audio error: \(error.localizedDescription)")
     }
 }
 

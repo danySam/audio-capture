@@ -10,6 +10,7 @@ $(BINARY): $(SOURCES)
 install: $(BINARY)
 	install -d $(INSTALL_DIR)
 	install -m 755 $(BINARY) $(INSTALL_DIR)/$(BINARY)
+	install -m 755 scripts/transcribe $(INSTALL_DIR)/transcribe
 
 clean:
 	rm -f $(BINARY)

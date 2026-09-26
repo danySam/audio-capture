@@ -3,30 +3,6 @@ import AVFoundation
 
 // MARK: - Helpers
 
-func mergeAudio(system: URL, mic: URL, to output: URL) async throws {
-    let systemAsset = AVURLAsset(url: system)
-    let micAsset = AVURLAsset(url: mic)
-
-    let composition = AVMutableComposition()
-
-    if let track = try await systemAsset.loadTracks(withMediaType: .audio).first,
-       let compTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) {
-        let duration = try await systemAsset.load(.duration)
-        try compTrack.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: track, at: .zero)
-    }
-
-    if let track = try await micAsset.loadTracks(withMediaType: .audio).first,
-       let compTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) {
-        let duration = try await micAsset.load(.duration)
-        try compTrack.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: track, at: .zero)
-    }
-
-    guard let session = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A) else {
-        throw NSError(domain: "AudioCapture", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to create export session"])
-    }
-    try await session.export(to: output, as: .m4a)
-}
-
 func discoverInputDevices() -> [AVCaptureDevice] {
     AVCaptureDevice.DiscoverySession(
         deviceTypes: [.microphone],
@@ -45,28 +21,35 @@ var outputDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Recordings")
 var label: String? = nil
 var deviceQuery: String? = nil
+var pipeRate = 16000.0
 
 var args = CommandLine.arguments.dropFirst().makeIterator()
 while let arg = args.next() {
     switch arg {
     case "--output", "-o":
         guard let path = args.next() else {
-            fputs("Error: --output requires a path\n", stderr)
+            eprint("Error: --output requires a path")
             exit(1)
         }
         outputDir = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
     case "--name", "-n":
         guard let name = args.next() else {
-            fputs("Error: --name requires a label\n", stderr)
+            eprint("Error: --name requires a label")
             exit(1)
         }
         label = name
     case "--device", "-d":
         guard let name = args.next() else {
-            fputs("Error: --device requires a device name\n", stderr)
+            eprint("Error: --device requires a device name")
             exit(1)
         }
         deviceQuery = name
+    case "--pipe-rate", "-r":
+        guard let value = args.next(), let rate = Double(value), rate >= 8000, rate <= 192000 else {
+            eprint("Error: --pipe-rate requires a sample rate in Hz (e.g. 16000)")
+            exit(1)
+        }
+        pipeRate = rate
     case "--list-devices", "-l":
         let devices = discoverInputDevices()
         let defaultDevice = AVCaptureDevice.default(for: .audio)
@@ -83,44 +66,51 @@ while let arg = args.next() {
         print("""
         audio-capture — Record system audio and microphone
 
-        Usage: audio-capture [options]
+        Usage: audio-capture [options] [| other-command]
 
         Options:
           -n, --name <label>    Label for the recording (e.g. "standup", "1on1-with-alex")
           -d, --device <name>   Microphone to use (substring match, see --list-devices)
           -l, --list-devices    List available microphones
           -o, --output <dir>    Output directory (default: ~/Recordings)
+          -r, --pipe-rate <hz>  Sample rate of piped audio (default: 16000)
           -h, --help            Show this help
 
-        Saves a single merged .m4a file with both system audio and mic:
+        Saves a single mixed .m4a file with both system audio and mic:
           <timestamp>[_label].m4a
+
+        When stdout is piped, the mixed audio is also streamed live as raw PCM
+        (signed 16-bit little-endian, mono, --pipe-rate Hz). Status goes to stderr.
+          audio-capture -n standup | transcribe -o standup.txt
 
         Press Ctrl+C to stop recording.
         First run will prompt for Screen Recording and Microphone permissions.
         """)
         exit(0)
     default:
-        fputs("Unknown option: \(arg). Use --help for usage.\n", stderr)
+        eprint("Unknown option: \(arg). Use --help for usage.")
         exit(1)
     }
 }
+
+let piping = isatty(STDOUT_FILENO) == 0
 
 // MARK: - Resolve mic device
 
 let micDevice: AVCaptureDevice
 if let query = deviceQuery {
     guard let device = findDevice(matching: query) else {
-        fputs("No input device matching \"\(query)\".\n", stderr)
-        fputs("Available devices:\n", stderr)
+        eprint("No input device matching \"\(query)\".")
+        eprint("Available devices:")
         for device in discoverInputDevices() {
-            fputs("  \(device.localizedName)\n", stderr)
+            eprint("  \(device.localizedName)")
         }
         exit(1)
     }
     micDevice = device
 } else {
     guard let device = AVCaptureDevice.default(for: .audio) else {
-        fputs("No audio input device found.\n", stderr)
+        eprint("No audio input device found.")
         exit(1)
     }
     micDevice = device
@@ -135,17 +125,32 @@ formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
 let timestamp = formatter.string(from: Date())
 let sanitizedLabel = label.map { $0.replacingOccurrences(of: "[^a-zA-Z0-9_-]", with: "-", options: .regularExpression) }
 let prefix = [timestamp, sanitizedLabel].compactMap({ $0 }).joined(separator: "_")
+let outputURL = outputDir.appendingPathComponent("\(prefix).m4a")
 
-let tempDir = FileManager.default.temporaryDirectory
-    .appendingPathComponent("audio-capture-\(ProcessInfo.processInfo.processIdentifier)")
-try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-let systemTempURL = tempDir.appendingPathComponent("system.m4a")
-let micTempURL = tempDir.appendingPathComponent("mic.m4a")
+let output: RecordingOutput
+do {
+    output = try RecordingOutput(fileURL: outputURL, pipeSampleRate: piping ? pipeRate : nil)
+} catch {
+    eprint("Failed to create output file: \(error.localizedDescription)")
+    exit(1)
+}
+
+let mixer = AudioMixer { output.write($0) }
+let systemExtractor = SampleExtractor()
+let micExtractor = SampleExtractor()
+
+func abort(_ message: String) -> Never {
+    eprint(message)
+    output.close()
+    try? FileManager.default.removeItem(at: outputURL)
+    exit(1)
+}
 
 // MARK: - Signal handling (Ctrl+C / kill)
 
 signal(SIGINT, SIG_IGN)
 signal(SIGTERM, SIG_IGN)
+signal(SIGPIPE, SIG_IGN)
 
 let stopSignal = AsyncStream<Void> { continuation in
     let sources = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
@@ -160,71 +165,66 @@ let stopSignal = AsyncStream<Void> { continuation in
     continuation.onTermination = { _ in sources.forEach { $0.cancel() } }
 }
 
-// MARK: - Start system audio
+// MARK: - Start capture
 
-print("Starting recording...")
+eprint("Starting recording...")
 
-let systemRecorder = SystemAudioRecorder()
+let systemRecorder = SystemAudioRecorder { buffer, hostTime in
+    if let samples = systemExtractor.samples(from: buffer) {
+        mixer.append(samples, from: .system, at: hostTime)
+    }
+}
 do {
-    try await systemRecorder.start(to: systemTempURL)
+    try await systemRecorder.start()
 } catch {
-    fputs("Failed to start system audio: \(error.localizedDescription)\n", stderr)
-    fputs("Grant Screen Recording permission in System Settings → Privacy & Security.\n", stderr)
-    try? FileManager.default.removeItem(at: tempDir)
-    exit(1)
+    abort("""
+    Failed to start system audio: \(error.localizedDescription)
+    Grant Screen Recording permission in System Settings → Privacy & Security.
+    """)
 }
 
-// MARK: - Start microphone
-
-let micRecorder = MicRecorder()
+let micRecorder = MicRecorder { buffer, hostTime in
+    if let samples = micExtractor.samples(from: buffer) {
+        mixer.append(samples, from: .mic, at: hostTime)
+    }
+}
 do {
-    try micRecorder.start(to: micTempURL, device: micDevice)
+    try micRecorder.start(device: micDevice)
 } catch {
-    fputs("Failed to start microphone: \(error.localizedDescription)\n", stderr)
-    fputs("Grant Microphone permission in System Settings → Privacy & Security.\n", stderr)
     try? await systemRecorder.stop()
-    try? FileManager.default.removeItem(at: tempDir)
-    exit(1)
+    abort("""
+    Failed to start microphone: \(error.localizedDescription)
+    Grant Microphone permission in System Settings → Privacy & Security.
+    """)
 }
 
 // MARK: - Recording
 
 let startTime = Date()
-print("Recording started at \(DateFormatter.localizedString(from: startTime, dateStyle: .none, timeStyle: .short))")
-print("  Microphone: \(micDevice.localizedName)")
-print("Press Ctrl+C to stop.")
+eprint("Recording started at \(DateFormatter.localizedString(from: startTime, dateStyle: .none, timeStyle: .short))")
+eprint("  Microphone: \(micDevice.localizedName)")
+eprint("  File:       \(outputURL.path)")
+if piping {
+    eprint("  Stdout:     s16le mono \(Int(pipeRate)) Hz")
+}
+eprint("Press Ctrl+C to stop.")
 
 for await _ in stopSignal { break }
 
-// MARK: - Stop and merge
+// MARK: - Stop
 
 let elapsed = Int(Date().timeIntervalSince(startTime))
 
-print("\nStopping...")
-await micRecorder.stop()
-try await systemRecorder.stop()
+eprint("\nStopping...")
+micRecorder.stop()
+try? await systemRecorder.stop()
+mixer.finish()
+output.close()
 
 let h = elapsed / 3600
 let m = (elapsed % 3600) / 60
 let s = elapsed % 60
 let duration = h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
 
-let outputURL = outputDir.appendingPathComponent("\(prefix).m4a")
-
-print("Merging audio...")
-do {
-    try await mergeAudio(system: systemTempURL, mic: micTempURL, to: outputURL)
-    try? FileManager.default.removeItem(at: tempDir)
-    print("Saved (\(duration))")
-    print("  \(outputURL.path)")
-} catch {
-    let systemFallback = outputDir.appendingPathComponent("\(prefix)_system.m4a")
-    let micFallback = outputDir.appendingPathComponent("\(prefix)_mic.m4a")
-    try? FileManager.default.moveItem(at: systemTempURL, to: systemFallback)
-    try? FileManager.default.moveItem(at: micTempURL, to: micFallback)
-    try? FileManager.default.removeItem(at: tempDir)
-    fputs("Merge failed: \(error.localizedDescription)\n", stderr)
-    print("Saved individual files instead (\(duration)):")
-    print("  \(systemFallback.path)")
-    print("  \(micFallback.path)")
-}
+eprint("Saved (\(duration))")
+eprint("  \(outputURL.path)")
